@@ -3,6 +3,7 @@ import { z } from "npm:zod@3.22.4";
 import { v4 as uuidv4 } from "npm:uuid@9.0.1";
 import { Anthropic } from "npm:@anthropic-ai/sdk@0.18.0";
 import { createClient } from "npm:@supabase/supabase-js@2.39.7";
+import { crypto } from "https://deno.land/std@0.177.0/crypto/mod.ts";
 
 // Initialize Supabase client
 const supabaseClient = createClient(
@@ -22,6 +23,12 @@ const taskUpdateSchema = z.object({
   status: z.enum(["pending", "processing", "completed", "failed"]).optional(),
 });
 
+const apiKeySchema = z.object({
+  name: z.string().min(1, "Name is required"),
+  userId: z.string().uuid().optional(),
+  expiresAt: z.string().datetime().optional(),
+});
+
 // Error handling
 class APIError extends Error {
   constructor(
@@ -38,16 +45,205 @@ class APIError extends Error {
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key",
+};
+
+// Rate limiting class
+class RateLimiter {
+  private readonly MAX_REQUESTS = 60; // Max requests per window
+  private readonly WINDOW_MS = 60 * 1000; // 1 minute window
+  
+  async check(identifier: string): Promise<boolean> {
+    const now = new Date();
+    const windowStart = new Date(now.getTime() - this.WINDOW_MS);
+    
+    const { count, error } = await supabaseClient
+      .from("metrics")
+      .select("*", { count: "exact", head: true })
+      .eq("metric_type", "rate_limit")
+      .gte("timestamp", windowStart.toISOString())
+      .eq("value->identifier", identifier);
+    
+    if (error) {
+      console.error("Rate limit check error:", error);
+      return true; // Allow request if we can't check the limit
+    }
+    
+    if (count < this.MAX_REQUESTS) {
+      await supabaseClient
+        .from("metrics")
+        .insert({
+          metric_type: "rate_limit",
+          value: { identifier, timestamp: now.toISOString() }
+        });
+      return true;
+    }
+    
+    return false;
+  }
+  
+  async getRetryAfter(identifier: string): Promise<number> {
+    const { data, error } = await supabaseClient
+      .from("metrics")
+      .select("timestamp")
+      .eq("metric_type", "rate_limit")
+      .eq("value->identifier", identifier)
+      .order("timestamp", { ascending: true })
+      .limit(1);
+    
+    if (error || !data || data.length === 0) return 60;
+    
+    const oldestTimestamp = new Date(data[0].timestamp);
+    const resetTime = new Date(oldestTimestamp.getTime() + this.WINDOW_MS);
+    const now = new Date();
+    
+    return Math.max(0, Math.ceil((resetTime.getTime() - now.getTime()) / 1000));
+  }
+}
+
+const rateLimiter = new RateLimiter();
+
+// API Key validation
+const validateApiKey = async (apiKey: string): Promise<boolean> => {
+  const keyHash = apiKey; // In production, hash the key first
+  
+  const { data, error } = await supabaseClient
+    .from("api_keys")
+    .select("id, expires_at")
+    .eq("key_hash", keyHash)
+    .single();
+  
+  if (error || !data) return false;
+  
+  if (data.expires_at && new Date(data.expires_at) < new Date()) return false;
+  
+  await supabaseClient
+    .from("api_keys")
+    .update({ last_used_at: new Date().toISOString() })
+    .eq("id", data.id);
+  
+  return true;
 };
 
 // Middleware
-const authenticate = (req: Request): void => {
+const authenticate = async (req: Request): Promise<void> => {
   const authHeader = req.headers.get("Authorization");
   if (!authHeader?.startsWith("Bearer ")) {
     throw new APIError("authentication_error", "Invalid authentication token", undefined, 401);
   }
-  // TODO: Implement proper token validation
+  
+  const token = authHeader.substring(7);
+  const isValid = await validateApiKey(token);
+  
+  if (!isValid) {
+    throw new APIError("authentication_error", "Invalid API key", undefined, 403);
+  }
+};
+
+const checkRateLimit = async (req: Request): Promise<void> => {
+  const identifier = req.headers.get("X-Forwarded-For") || 
+                    req.headers.get("Authorization")?.substring(7) || 
+                    "unknown";
+  
+  if (!await rateLimiter.check(identifier)) {
+    const retryAfter = await rateLimiter.getRetryAfter(identifier);
+    throw new APIError(
+      "rate_limit_exceeded",
+      "Rate limit exceeded",
+      { retryAfter },
+      429
+    );
+  }
+};
+
+// API Key management endpoints
+const createApiKey = async (req: Request): Promise<Response> => {
+  const body = await req.json();
+  const validatedData = apiKeySchema.parse(body);
+  
+  const apiKey = crypto.randomUUID();
+  const keyHash = apiKey; // In production, hash the key
+  
+  const { data, error } = await supabaseClient
+    .from("api_keys")
+    .insert({
+      key_hash: keyHash,
+      name: validatedData.name,
+      user_id: validatedData.userId || null,
+      expires_at: validatedData.expiresAt || null
+    })
+    .select()
+    .single();
+  
+  if (error) {
+    throw new APIError("database_error", "Failed to create API key", { error: error.message });
+  }
+  
+  return new Response(
+    JSON.stringify({
+      success: true,
+      apiKey: apiKey,
+      data: {
+        id: data.id,
+        name: data.name,
+        created_at: data.created_at,
+        expires_at: data.expires_at
+      }
+    }),
+    { headers: { "Content-Type": "application/json", ...corsHeaders } }
+  );
+};
+
+const listApiKeys = async (req: Request): Promise<Response> => {
+  const url = new URL(req.url);
+  const userId = url.searchParams.get("userId");
+  
+  if (!userId) {
+    throw new APIError("invalid_request", "User ID is required");
+  }
+  
+  const { data, error } = await supabaseClient
+    .from("api_keys")
+    .select("id, name, created_at, expires_at, last_used_at")
+    .eq("user_id", userId);
+  
+  if (error) {
+    throw new APIError("database_error", "Failed to list API keys", { error: error.message });
+  }
+  
+  return new Response(
+    JSON.stringify({
+      success: true,
+      data
+    }),
+    { headers: { "Content-Type": "application/json", ...corsHeaders } }
+  );
+};
+
+const revokeApiKey = async (req: Request): Promise<Response> => {
+  const url = new URL(req.url);
+  const keyId = url.searchParams.get("keyId");
+  
+  if (!keyId) {
+    throw new APIError("invalid_request", "Key ID is required");
+  }
+  
+  const { error } = await supabaseClient
+    .from("api_keys")
+    .delete()
+    .eq("id", keyId);
+  
+  if (error) {
+    throw new APIError("database_error", "Failed to revoke API key", { error: error.message });
+  }
+  
+  return new Response(
+    JSON.stringify({
+      success: true,
+      message: "API key revoked successfully"
+    }),
+    { headers: { "Content-Type": "application/json", ...corsHeaders } }
+  );
 };
 
 // Route handlers
@@ -57,7 +253,6 @@ const createTask = async (req: Request): Promise<Response> => {
 
   const taskId = uuidv4();
   
-  // Create task in Supabase
   const { error: insertError } = await supabaseClient
     .from("tasks")
     .insert({
@@ -71,7 +266,6 @@ const createTask = async (req: Request): Promise<Response> => {
     throw new APIError("database_error", "Failed to create task", { error: insertError.message });
   }
 
-  // Initialize Claude API client
   const anthropic = new Anthropic({
     apiKey: Deno.env.get("ANTHROPIC_API_KEY") || "",
   });
@@ -94,7 +288,6 @@ const createTask = async (req: Request): Promise<Response> => {
       total: (completion.usage?.input_tokens || 0) + (completion.usage?.output_tokens || 0),
     };
 
-    // Update task with implementation and token usage
     const { error: updateError } = await supabaseClient
       .from("tasks")
       .update({
@@ -122,7 +315,6 @@ const createTask = async (req: Request): Promise<Response> => {
       }
     );
   } catch (error) {
-    // Update task with error status
     const { error: updateError } = await supabaseClient
       .from("tasks")
       .update({
@@ -293,7 +485,6 @@ const deleteTask = async (taskId: string): Promise<Response> => {
 
 // Main request handler
 const handleRequest = async (req: Request): Promise<Response> => {
-  // Handle CORS preflight requests
   if (req.method === "OPTIONS") {
     return new Response(null, {
       headers: corsHeaders,
@@ -301,7 +492,8 @@ const handleRequest = async (req: Request): Promise<Response> => {
   }
 
   try {
-    authenticate(req);
+    await authenticate(req);
+    await checkRateLimit(req);
 
     const url = new URL(req.url);
     const pathParts = url.pathname.split("/").filter(Boolean);
@@ -309,6 +501,12 @@ const handleRequest = async (req: Request): Promise<Response> => {
     if (pathParts[0] !== "api" || pathParts[1] !== "v1") {
       throw new APIError("not_found", "Endpoint not found", undefined, 404);
     }
+
+    const responseHeaders = {
+      ...corsHeaders,
+      "Content-Type": "application/json",
+      "X-API-Version": "v1",
+    };
 
     switch (true) {
       case req.method === "POST" && pathParts[2] === "tasks":
@@ -321,6 +519,12 @@ const handleRequest = async (req: Request): Promise<Response> => {
         return await updateTask(req, pathParts[3]);
       case req.method === "DELETE" && pathParts[2] === "tasks" && pathParts.length === 3:
         return await deleteTask(pathParts[3]);
+      case req.method === "POST" && pathParts[2] === "api-keys":
+        return await createApiKey(req);
+      case req.method === "GET" && pathParts[2] === "api-keys":
+        return await listApiKeys(req);
+      case req.method === "DELETE" && pathParts[2] === "api-keys":
+        return await revokeApiKey(req);
       default:
         throw new APIError("not_found", "Endpoint not found", undefined, 404);
     }
