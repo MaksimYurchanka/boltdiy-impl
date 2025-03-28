@@ -1,8 +1,26 @@
-For all designs I ask you to make, have them be beautiful, not cookie cutter. Make webpages that are fully featured and worthy for production.
+# bolt.diy-impl (Layer 2) - Integration API
 
-By default, this template supports JSX syntax with Tailwind CSS classes, React hooks, and Lucide React for icons. Do not install other packages for UI themes, icons, etc unless absolutely necessary or I request them.
+This project implements the Integration Layer (Layer 2) of the AIACD 4-layer architecture, serving as the critical bridge between the Orchestration Layer (Layer 1) and the Implementation Environment (Layer 3).
 
-Use icons from lucide-react for logos.
+## Key Responsibilities:
+- Implement RESTful API endpoints for bidirectional communication
+- Handle authentication between layers with API key validation
+- Process task submissions from Layer 1 to Layer 3
+- Return implementation results from Layer 3 to Layer 1
+- Track token usage and efficiency metrics
+- Manage file operations across the system
 
-Use stock photos from unsplash where appropriate, only valid URLs you know exist. Do not download the images, only link to them in image tags.
+## Implementation Focus:
+- API-first design with clear endpoint specifications
+- Supabase integration for data persistence
+- Secure authentication and request validation
+- Comprehensive error handling with standard response formats
+- Task queuing and status tracking
+- Token usage tracking for efficiency measurement
 
+## Current Priorities:
+- Core task management endpoints (create, status, retrieve, modify)
+- Authentication middleware implementation
+- bolt.diy-standalone client for Layer 3 communication
+- Supabase integration for data persistence
+- Token tracking metrics system

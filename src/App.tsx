@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
-import { Send, Code, AlertCircle } from 'lucide-react';
+import { Send, Code, AlertCircle, Trash2, RefreshCw } from 'lucide-react';
 
 interface ApiResponse {
   success: boolean;
   taskId?: string;
+  status?: string;
+  implementation?: string;
   error?: {
     code: string;
     message: string;
@@ -13,6 +15,7 @@ interface ApiResponse {
 
 function App() {
   const [prompt, setPrompt] = useState('');
+  const [taskId, setTaskId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<ApiResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -28,12 +31,58 @@ function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': 'Bearer YOUR_API_KEY', // Replace with actual API key
+          'Authorization': 'Bearer YOUR_API_KEY',
         },
         body: JSON.stringify({ prompt }),
       });
 
       const data = await response.json();
+      setResult(data);
+      if (data.success && data.taskId) {
+        setTaskId(data.taskId);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'An error occurred');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const checkStatus = async () => {
+    if (!taskId) return;
+    
+    setLoading(true);
+    try {
+      const response = await fetch(`/api/v1/tasks/${taskId}/status`, {
+        headers: {
+          'Authorization': 'Bearer YOUR_API_KEY',
+        },
+      });
+      const data = await response.json();
+      setResult(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'An error occurred');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deleteTask = async () => {
+    if (!taskId) return;
+    
+    setLoading(true);
+    try {
+      const response = await fetch(`/api/v1/tasks/${taskId}`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': 'Bearer YOUR_API_KEY',
+        },
+      });
+      const data = await response.json();
+      if (data.success) {
+        setTaskId(null);
+        setResult(null);
+      }
       setResult(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
@@ -74,11 +123,11 @@ function App() {
               </div>
             </div>
 
-            <div>
+            <div className="flex space-x-4">
               <button
                 type="submit"
                 disabled={loading}
-                className={`w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white ${
+                className={`flex-1 flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white ${
                   loading
                     ? 'bg-indigo-400 cursor-not-allowed'
                     : 'bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500'
@@ -93,6 +142,27 @@ function App() {
                   </>
                 )}
               </button>
+
+              {taskId && (
+                <>
+                  <button
+                    type="button"
+                    onClick={checkStatus}
+                    disabled={loading}
+                    className="flex-none flex items-center justify-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500"
+                  >
+                    <RefreshCw className="h-5 w-5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={deleteTask}
+                    disabled={loading}
+                    className="flex-none flex items-center justify-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-red-600 hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500"
+                  >
+                    <Trash2 className="h-5 w-5" />
+                  </button>
+                </>
+              )}
             </div>
           </form>
 
@@ -117,7 +187,18 @@ function App() {
                   </h3>
                   <div className="mt-2 text-sm text-green-700">
                     {result.success
-                      ? `Task created with ID: ${result.taskId}`
+                      ? (
+                        <div>
+                          {result.taskId && <div>Task ID: {result.taskId}</div>}
+                          {result.status && <div>Status: {result.status}</div>}
+                          {result.implementation && (
+                            <div>
+                              <div className="font-semibold mt-2">Implementation:</div>
+                              <pre className="mt-2 whitespace-pre-wrap">{result.implementation}</pre>
+                            </div>
+                          )}
+                        </div>
+                      )
                       : result.error?.message}
                   </div>
                 </div>

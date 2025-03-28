@@ -7,6 +7,8 @@ import { Anthropic } from 'npm:@anthropic-ai/sdk@0.18.0';
 interface Task {
   id: string;
   status: 'pending' | 'processing' | 'completed' | 'failed';
+  prompt: string;
+  context?: string;
   implementation?: string;
   error?: {
     code: string;
@@ -22,8 +24,14 @@ const tasks = new Map<string, Task>();
 
 // Validation schemas
 const taskSchema = z.object({
-  prompt: z.string().min(1),
+  prompt: z.string().min(1, "Prompt cannot be empty"),
   context: z.string().optional(),
+});
+
+const taskUpdateSchema = z.object({
+  prompt: z.string().min(1).optional(),
+  context: z.string().optional(),
+  status: z.enum(['pending', 'processing', 'completed', 'failed']).optional(),
 });
 
 const errorSchema = z.object({
@@ -43,6 +51,13 @@ class APIError extends Error {
     super(message);
   }
 }
+
+// CORS headers
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, Idempotency-Key',
+};
 
 // Middleware
 const authenticate = (req: Request): void => {
@@ -70,13 +85,15 @@ const createTask = async (req: Request): Promise<Response> => {
   const task: Task = {
     id: taskId,
     status: 'pending',
+    prompt: validatedData.prompt,
+    context: validatedData.context,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
 
   tasks.set(taskId, task);
 
-  // TODO: Implement Claude API integration
+  // Initialize Claude API client
   const anthropic = new Anthropic({
     apiKey: Deno.env.get('ANTHROPIC_API_KEY') || '',
   });
@@ -98,9 +115,19 @@ const createTask = async (req: Request): Promise<Response> => {
     task.updatedAt = new Date();
     tasks.set(taskId, task);
 
-    return new Response(JSON.stringify({ success: true, taskId }), {
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return new Response(
+      JSON.stringify({ 
+        success: true, 
+        taskId,
+        status: task.status 
+      }),
+      { 
+        headers: { 
+          'Content-Type': 'application/json',
+          ...corsHeaders 
+        } 
+      }
+    );
   } catch (error) {
     task.status = 'failed';
     task.error = {
@@ -125,8 +152,15 @@ const getTaskStatus = (taskId: string): Response => {
       success: true,
       status: task.status,
       error: task.error,
+      createdAt: task.createdAt,
+      updatedAt: task.updatedAt,
     }),
-    { headers: { 'Content-Type': 'application/json' } },
+    { 
+      headers: { 
+        'Content-Type': 'application/json',
+        ...corsHeaders 
+      } 
+    }
   );
 };
 
@@ -148,13 +182,95 @@ const getTaskImplementation = (taskId: string): Response => {
     JSON.stringify({
       success: true,
       implementation: task.implementation,
+      status: task.status,
+      createdAt: task.createdAt,
+      updatedAt: task.updatedAt,
     }),
-    { headers: { 'Content-Type': 'application/json' } },
+    { 
+      headers: { 
+        'Content-Type': 'application/json',
+        ...corsHeaders 
+      } 
+    }
+  );
+};
+
+const updateTask = async (req: Request, taskId: string): Promise<Response> => {
+  const task = tasks.get(taskId);
+  if (!task) {
+    throw new APIError('not_found', 'Task not found', undefined, 404);
+  }
+
+  const body = await req.json();
+  const validatedData = taskUpdateSchema.parse(body);
+
+  // Update task properties
+  if (validatedData.prompt) task.prompt = validatedData.prompt;
+  if (validatedData.context) task.context = validatedData.context;
+  if (validatedData.status) task.status = validatedData.status;
+  task.updatedAt = new Date();
+
+  tasks.set(taskId, task);
+
+  return new Response(
+    JSON.stringify({
+      success: true,
+      task: {
+        id: task.id,
+        status: task.status,
+        prompt: task.prompt,
+        context: task.context,
+        updatedAt: task.updatedAt,
+      },
+    }),
+    { 
+      headers: { 
+        'Content-Type': 'application/json',
+        ...corsHeaders 
+      } 
+    }
+  );
+};
+
+const deleteTask = (taskId: string): Response => {
+  const task = tasks.get(taskId);
+  if (!task) {
+    throw new APIError('not_found', 'Task not found', undefined, 404);
+  }
+
+  if (task.status === 'processing') {
+    throw new APIError(
+      'invalid_request',
+      'Cannot delete a task that is currently processing',
+      { status: task.status },
+    );
+  }
+
+  tasks.delete(taskId);
+
+  return new Response(
+    JSON.stringify({
+      success: true,
+      message: 'Task deleted successfully',
+    }),
+    { 
+      headers: { 
+        'Content-Type': 'application/json',
+        ...corsHeaders 
+      } 
+    }
   );
 };
 
 // Main request handler
 const handleRequest = async (req: Request): Promise<Response> => {
+  // Handle CORS preflight requests
+  if (req.method === 'OPTIONS') {
+    return new Response(null, {
+      headers: corsHeaders,
+    });
+  }
+
   try {
     authenticate(req);
 
@@ -175,6 +291,10 @@ const handleRequest = async (req: Request): Promise<Response> => {
         return getTaskStatus(pathParts[3]);
       case req.method === 'GET' && pathParts[2] === 'tasks' && pathParts[4] === 'implementation':
         return getTaskImplementation(pathParts[3]);
+      case req.method === 'PUT' && pathParts[2] === 'tasks' && pathParts.length === 3:
+        return await updateTask(req, pathParts[3]);
+      case req.method === 'DELETE' && pathParts[2] === 'tasks' && pathParts.length === 3:
+        return deleteTask(pathParts[3]);
       default:
         throw new APIError('not_found', 'Endpoint not found', undefined, 404);
     }
@@ -189,10 +309,16 @@ const handleRequest = async (req: Request): Promise<Response> => {
       },
     };
 
-    return new Response(JSON.stringify(errorResponse), {
-      status,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return new Response(
+      JSON.stringify(errorResponse),
+      {
+        status,
+        headers: { 
+          'Content-Type': 'application/json',
+          ...corsHeaders 
+        },
+      }
+    );
   }
 };
 
