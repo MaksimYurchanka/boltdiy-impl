@@ -11,6 +11,20 @@ const supabaseClient = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "",
 );
 
+// Initialize bolt.diy client
+const boltDiyClient = {
+  baseUrl: Deno.env.get("BOLT_DIY_URL") || "http://localhost:5173",
+  timeout: 30000,
+  retries: 3,
+  retryDelay: 1000,
+};
+
+// Initialize file manager
+const fileManager = {
+  supabase: supabaseClient,
+  bucketName: "project-files",
+};
+
 // Validation schemas
 const taskSchema = z.object({
   prompt: z.string().min(1, "Prompt cannot be empty"),
@@ -266,11 +280,51 @@ const createTask = async (req: Request): Promise<Response> => {
     throw new APIError("database_error", "Failed to create task", { error: insertError.message });
   }
 
-  const anthropic = new Anthropic({
-    apiKey: Deno.env.get("ANTHROPIC_API_KEY") || "",
-  });
-
   try {
+    // Try bolt.diy first
+    const boltDiyResponse = await fetch(`${boltDiyClient.baseUrl}/api/implementation`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        prompt: validatedData.prompt,
+        context: validatedData.context,
+      }),
+    });
+
+    if (boltDiyResponse.ok) {
+      const { error: updateError } = await supabaseClient
+        .from("tasks")
+        .update({
+          status: "processing",
+        })
+        .eq("id", taskId);
+
+      if (updateError) {
+        throw new APIError("database_error", "Failed to update task", { error: updateError.message });
+      }
+
+      return new Response(
+        JSON.stringify({ 
+          success: true, 
+          taskId,
+          status: "processing",
+        }),
+        { 
+          headers: { 
+            "Content-Type": "application/json",
+            ...corsHeaders,
+          },
+        }
+      );
+    }
+
+    // Fallback to Claude if bolt.diy is not available
+    const anthropic = new Anthropic({
+      apiKey: Deno.env.get("ANTHROPIC_API_KEY") || "",
+    });
+
     const completion = await anthropic.messages.create({
       model: "claude-3-opus-20240229",
       max_tokens: 4000,
@@ -320,7 +374,7 @@ const createTask = async (req: Request): Promise<Response> => {
       .update({
         status: "failed",
         error: {
-          code: "claude_api_error",
+          code: "processing_error",
           message: error.message,
         },
       })
@@ -347,6 +401,32 @@ const getTaskStatus = async (taskId: string): Promise<Response> => {
 
   if (!task) {
     throw new APIError("not_found", "Task not found", undefined, 404);
+  }
+
+  if (task.status === "processing") {
+    try {
+      const boltDiyResponse = await fetch(
+        `${boltDiyClient.baseUrl}/api/implementation/${taskId}/status`
+      );
+      if (boltDiyResponse.ok) {
+        const boltDiyStatus = await boltDiyResponse.json();
+        return new Response(
+          JSON.stringify({
+            success: true,
+            status: boltDiyStatus.status,
+            progress: boltDiyStatus.progress,
+          }),
+          { 
+            headers: { 
+              "Content-Type": "application/json",
+              ...corsHeaders,
+            },
+          }
+        );
+      }
+    } catch (error) {
+      console.error("Failed to fetch bolt.diy status:", error);
+    }
   }
 
   return new Response(
@@ -387,6 +467,32 @@ const getTaskImplementation = async (taskId: string): Promise<Response> => {
     );
   }
 
+  // Try to get implementation from bolt.diy first
+  try {
+    const boltDiyResponse = await fetch(
+      `${boltDiyClient.baseUrl}/api/implementation/${taskId}`
+    );
+    if (boltDiyResponse.ok) {
+      const boltDiyImplementation = await boltDiyResponse.json();
+      return new Response(
+        JSON.stringify({
+          success: true,
+          implementation: boltDiyImplementation.implementation,
+          files: boltDiyImplementation.files,
+        }),
+        { 
+          headers: { 
+            "Content-Type": "application/json",
+            ...corsHeaders,
+          },
+        }
+      );
+    }
+  } catch (error) {
+    console.error("Failed to fetch bolt.diy implementation:", error);
+  }
+
+  // Fallback to database implementation
   return new Response(
     JSON.stringify({
       success: true,
