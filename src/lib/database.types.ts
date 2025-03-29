@@ -49,6 +49,7 @@ export interface Database {
           token_usage: Json | null
           created_at: string
           updated_at: string
+          template_id: string | null
         }
         Insert: {
           id?: string
@@ -60,6 +61,7 @@ export interface Database {
           token_usage?: Json | null
           created_at?: string
           updated_at?: string
+          template_id?: string | null
         }
         Update: {
           id?: string
@@ -71,6 +73,7 @@ export interface Database {
           token_usage?: Json | null
           created_at?: string
           updated_at?: string
+          template_id?: string | null
         }
       }
       templates: {
@@ -121,13 +124,39 @@ export interface Database {
       }
     }
     Views: {
-      [_ in never]: never
+      token_efficiency_metrics: {
+        Row: {
+          template_id: string | null
+          template_name: string
+          template_type: string
+          avg_tokens: number
+          min_tokens: number
+          max_tokens: number
+          usage_count: number
+          efficiency_ratio: number
+          calculated_at: string
+        }
+      }
+      token_metrics_timeseries: {
+        Row: {
+          day: string
+          task_type: string
+          task_count: number
+          avg_tokens: number
+          total_tokens: number
+          templates_used: number
+          day_over_day_efficiency: number | null
+        }
+      }
     }
     Functions: {
-      [_ in never]: never
+      refresh_token_efficiency_metrics: {
+        Args: Record<PropertyKey, never>
+        Returns: void
+      }
     }
     Enums: {
-      [_ in never]: never
+      metric_type: 'token_usage' | 'template_usage' | 'efficiency_ratio' | 'task_complexity' | 'template_effectiveness' | 'rate_limit'
     }
   }
 }
