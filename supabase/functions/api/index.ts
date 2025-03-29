@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from "npm:uuid@9.0.1";
 import { Anthropic } from "npm:@anthropic-ai/sdk@0.18.0";
 import { createClient } from "npm:@supabase/supabase-js@2.39.7";
 import { crypto } from "https://deno.land/std@0.177.0/crypto/mod.ts";
+import { templateSchema } from './lib/TemplateManager';
 
 // Initialize Supabase client
 const supabaseClient = createClient(
@@ -27,6 +28,9 @@ const fileManager = {
 
 // Initialize event publisher
 const eventPublisher = new EventPublisher();
+
+// Initialize template manager
+const templateManager = new TemplateManager(supabaseClient);
 
 // Validation schemas
 const taskSchema = z.object({
@@ -268,15 +272,34 @@ const createTask = async (req: Request): Promise<Response> => {
   const body = await req.json();
   const validatedData = taskSchema.parse(body);
 
+  // Get appropriate template based on task type
+  const { data: template, error: templateError } = await supabaseClient
+    .from("templates")
+    .select("*")
+    .eq("type", validatedData.type || "default")
+    .single();
+
+  let prompt = validatedData.prompt;
+  let templateId: string | null = null;
+
+  if (!templateError && template) {
+    prompt = templateManager.fillTemplate(template, {
+      ...validatedData,
+      timestamp: new Date().toISOString()
+    });
+    templateId = template.id;
+  }
+
   const taskId = uuidv4();
-  
+
   const { error: insertError } = await supabaseClient
     .from("tasks")
     .insert({
       id: taskId,
       status: "pending",
-      prompt: validatedData.prompt,
+      prompt,
       context: validatedData.context,
+      template_id: templateId
     });
 
   if (insertError) {
@@ -637,6 +660,120 @@ const streamTaskUpdates = async (req: Request, taskId: string): Promise<Response
   });
 };
 
+// Template endpoints
+const getTemplates = async (req: Request): Promise<Response> => {
+  const url = new URL(req.url);
+  const type = url.searchParams.get("type");
+  
+  let query = supabaseClient
+    .from("templates")
+    .select("*");
+    
+  if (type) {
+    query = query.eq("type", type);
+  }
+  
+  const { data, error } = await query;
+  
+  if (error) {
+    throw new APIError("database_error", "Failed to fetch templates", { error: error.message });
+  }
+  
+  return new Response(
+    JSON.stringify({
+      success: true,
+      data
+    }),
+    { headers: { "Content-Type": "application/json", ...corsHeaders } }
+  );
+};
+
+const getTemplate = async (req: Request, templateId: string): Promise<Response> => {
+  const { data, error } = await supabaseClient
+    .from("templates")
+    .select("*")
+    .eq("id", templateId)
+    .single();
+
+  if (error || !data) {
+    throw new APIError("not_found", "Template not found", undefined, 404);
+  }
+
+  return new Response(
+    JSON.stringify({
+      success: true,
+      data
+    }),
+    { headers: { "Content-Type": "application/json", ...corsHeaders } }
+  );
+};
+
+const createTemplate = async (req: Request): Promise<Response> => {
+  const body = await req.json();
+  const validatedData = templateSchema.parse(body);
+
+  const { data, error } = await supabaseClient
+    .from("templates")
+    .insert(validatedData)
+    .select()
+    .single();
+
+  if (error) {
+    throw new APIError("database_error", "Failed to create template", { error: error.message });
+  }
+
+  return new Response(
+    JSON.stringify({
+      success: true,
+      data
+    }),
+    { headers: { "Content-Type": "application/json", ...corsHeaders } }
+  );
+};
+
+const updateTemplate = async (req: Request, templateId: string): Promise<Response> => {
+  const body = await req.json();
+  const validatedData = templateSchema.partial().parse(body);
+
+  const { data, error } = await supabaseClient
+    .from("templates")
+    .update(validatedData)
+    .eq("id", templateId)
+    .select()
+    .single();
+
+  if (error) {
+    throw new APIError("database_error", "Failed to update template", { error: error.message });
+  }
+
+  return new Response(
+    JSON.stringify({
+      success: true,
+      data
+    }),
+    { headers: { "Content-Type": "application/json", ...corsHeaders } }
+  );
+};
+
+const deleteTemplate = async (req: Request, templateId: string): Promise<Response> => {
+  const { error } = await supabaseClient
+    .from("templates")
+    .delete()
+    .eq("id", templateId);
+
+  if (error) {
+    throw new APIError("database_error", "Failed to delete template", { error: error.message });
+  }
+
+  return new Response(
+    JSON.stringify({
+      success: true,
+      message: "Template deleted successfully"
+    }),
+    { headers: { "Content-Type": "application/json", ...corsHeaders } }
+  );
+};
+
 // Main request handler
 const handleRequest = async (req: Request): Promise<Response> => {
   if (req.method === "OPTIONS") {
@@ -684,6 +821,14 @@ const handleRequest = async (req: Request): Promise<Response> => {
         return await listApiKeys(req);
       case req.method === "DELETE" && pathParts[2] === "api-keys":
         return await revokeApiKey(req);
+      case req.method === "GET" && pathParts[2] === "templates":
+        return pathParts[3] ? await getTemplate(req, pathParts[3]) : await getTemplates(req);
+      case req.method === "POST" && pathParts[2] === "templates":
+        return await createTemplate(req);
+      case req.method === "PUT" && pathParts[2] === "templates":
+        return await updateTemplate(req, pathParts[3]);
+      case req.method === "DELETE" && pathParts[2] === "templates":
+        return await deleteTemplate(req, pathParts[3]);
       default:
         throw new APIError("not_found", "Endpoint not found", undefined, 404);
     }
