@@ -25,6 +25,9 @@ const fileManager = {
   bucketName: "project-files",
 };
 
+// Initialize event publisher
+const eventPublisher = new EventPublisher();
+
 // Validation schemas
 const taskSchema = z.object({
   prompt: z.string().min(1, "Prompt cannot be empty"),
@@ -589,6 +592,51 @@ const deleteTask = async (taskId: string): Promise<Response> => {
   );
 };
 
+// Add new streaming endpoint
+const streamTaskUpdates = async (req: Request, taskId: string): Promise<Response> => {
+  // Validate task exists
+  const { data: task, error } = await supabaseClient
+    .from("tasks")
+    .select("status")
+    .eq("id", taskId)
+    .single();
+
+  if (error || !task) {
+    throw new APIError("not_found", "Task not found", undefined, 404);
+  }
+
+  // Create streaming response
+  const stream = new ReadableStream({
+    start(controller) {
+      // Store connection in active connections map
+      const connectionId = crypto.randomUUID();
+      eventPublisher.subscribe(taskId, connectionId, controller);
+
+      // Send initial message
+      const initialEvent = {
+        type: "connected",
+        data: { taskId },
+        timestamp: new Date().toISOString(),
+      };
+      eventPublisher.publish(taskId, initialEvent);
+
+      // Set up cleanup on client disconnect
+      req.signal.addEventListener("abort", () => {
+        eventPublisher.unsubscribe(taskId, connectionId);
+      });
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      ...corsHeaders,
+    },
+  });
+};
+
 // Main request handler
 const handleRequest = async (req: Request): Promise<Response> => {
   if (req.method === "OPTIONS") {
@@ -606,6 +654,11 @@ const handleRequest = async (req: Request): Promise<Response> => {
 
     if (pathParts[0] !== "api" || pathParts[1] !== "v1") {
       throw new APIError("not_found", "Endpoint not found", undefined, 404);
+    }
+
+    // Add new route for streaming
+    if (req.method === "GET" && pathParts[2] === "tasks" && pathParts[4] === "stream") {
+      return await streamTaskUpdates(req, pathParts[3]);
     }
 
     const responseHeaders = {
